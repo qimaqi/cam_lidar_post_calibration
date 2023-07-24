@@ -17,6 +17,7 @@ from tqdm import trange
 import pandas as pd
 
 
+# 1550
 class States(Enum):
     CAMERA_SELECTION = 1
     LIDAR_SELECTION = 2
@@ -63,6 +64,13 @@ def read_frames(path):
     M=np.column_stack((v[0],v[1]))
     return M
 
+def make_rigid_matrix(rot, trans):
+    rot = rot.reshape(3,3)
+    trans = trans.reshape(3,1)
+    rigid = np.concatenate([rot,trans],axis=1)
+    rigid = np.concatenate([rigid, np.array([0,0,0,1]).reshape(1,4) ],axis=0)
+    return rigid
+
 
 def read_fix(path):
     # read fixpoint file into numpy array
@@ -73,6 +81,18 @@ def read_fix(path):
     M=np.column_stack((v[0],v[1],v[3],v[2],v[4],v[5],v[6]))
     return M
 
+
+def as_intrinsics_matrix(intrinsics):
+    """
+    Get matrix representation of intrinsics.
+
+    """
+    K = np.eye(3)
+    K[0, 0] = intrinsics[0]
+    K[1, 1] = intrinsics[1]
+    K[0, 2] = intrinsics[2]
+    K[1, 2] = intrinsics[3]
+    return K
 
 class CamLidarTool(object):
     def __init__(self, data_path, data_id, extract):
@@ -126,11 +146,18 @@ class CamLidarTool(object):
         self.point_cloud_timestamps_path = os.path.join(data_path,'tango','point-cloud.csv')
         self.point_cloud_timestamps = read_frames(self.point_cloud_timestamps_path)
 
+        # presee the point clouds
+
         frame_t, frame_index, pose_index, pointcloud_index = self.align_frame_pose_pointcloud(data_id)
+
+        # accumulate point cloud 
+        pointcloud_acc = self.accumulate_point_cloud(data_id)
+
 
         # load the image and pcl
         self.image = np.array(Image.open(camera_image_paths[frame_index]))
-        self.pointcloud = get_points_cloud(self.pointcloud_data_files[pointcloud_index])
+        self.pointcloud = pointcloud_acc #get_points_cloud(self.pointcloud_data_files[pointcloud_index])
+       
         self.imgpoints = []  # 2d correspondence points
         self.lidar_correspondences = []  # 3d correspondence points
 
@@ -166,13 +193,58 @@ class CamLidarTool(object):
 
         self.init_calibration()
 
+    def accumulate_point_cloud(self, data_id):
+        frame_t = self.frame_timestamps[data_id][0]
+        frame_index = int(self.frame_timestamps[data_id][1])
+        pointcloud_index = int(np.argmin((self.point_cloud_timestamps[:,0]-frame_t)**2))
+        pointcloud_index_previous_t = self.point_cloud_timestamps[pointcloud_index - 2,0]
+        pointcloud_index_future_t = self.point_cloud_timestamps[pointcloud_index + 2,0]
+        pose_index_previous = int(np.argmin((self.gt_path[:,0]-pointcloud_index_previous_t)**2)) - 1
+        pose_index_future = int(np.argmin((self.gt_path[:,0]-pointcloud_index_future_t)**2)) + 1
+        # pose interpolation
+        input_t = self.gt_path[pose_index_previous: pose_index_future,0]
+        input_trans = self.gt_path[pose_index_previous: pose_index_future,1:4]
+        input_rots = self.gt_path[pose_index_previous: pose_index_future,4:8]
+        input_rots = np.hstack([input_rots[:,1:4], input_rots[:,:1]]) # to x y z w
+        from scipy.spatial.transform import Rotation as R
+        from scipy.spatial.transform import Slerp
+        from scipy.interpolate import CubicSpline
+        input_rots = R.from_quat(input_rots)
+        slerp = Slerp(input_t, input_rots)
+        spline = CubicSpline(input_t, input_trans)
+        
+        target_pose_rot = slerp(frame_t).as_matrix()
+        target_pose_trans = spline(frame_t)
+        T_target = make_rigid_matrix(target_pose_rot, target_pose_trans)
+        
+        # accumulate lidar points to target
+        pointcloud_acc = []
+        for lidar_points_index in range(pointcloud_index - 1, pointcloud_index +2):
+            pointcloud_i = get_points_cloud(self.pointcloud_data_files[lidar_points_index])
+            rot_i = slerp(self.point_cloud_timestamps[lidar_points_index,0]).as_matrix()
+            trans_i = spline(self.point_cloud_timestamps[lidar_points_index,0])
+            Ti = make_rigid_matrix(rot_i,trans_i )
+            relative_transform = np.linalg.inv(T_target) @ Ti
+            pointcloud_i = np.concatenate([pointcloud_i, np.ones_like(pointcloud_i)[:,:1]], axis = -1)
+            pointcloud_i = (pointcloud_i @ relative_transform.transpose())[:,:3]
+            pointcloud_acc.append(pointcloud_i)
 
-    def align_frame_pose_pointcloud(self,data_id):
+        pointcloud_acc = np.concatenate((pointcloud_acc[0], pointcloud_acc[1], pointcloud_acc[2]), axis=0)
+
+        pointcloud_acc = pointcloud_acc.reshape(-1,3)
+        print("pointcloud_acc", np.shape(pointcloud_acc))
+        return pointcloud_acc
+            
+
+        
+
+    def align_frame_pose_pointcloud(self, data_id):
         frame_t = self.frame_timestamps[data_id][0]
         frame_index = int(self.frame_timestamps[data_id][1])
         pose_index = int(np.argmin((self.gt_path[:,0]-frame_t)**2))
         pointcloud_index = int(np.argmin((self.point_cloud_timestamps[:,0]-frame_t)**2))
         print('t difference of points and frame', self.point_cloud_timestamps[pointcloud_index,0] - frame_t) # TODO transform point cloud based on interpolation 
+        # assert np.abs(self.point_cloud_timestamps[pointcloud_index,0] - frame_t) < 0.1, f'{np.abs(self.point_cloud_timestamps[pointcloud_index,0] - frame_t)}'
         print('t difference of gt pose and frame', self.gt_path[pose_index,0] - frame_t) 
 
         return frame_t, frame_index, pose_index, pointcloud_index
@@ -185,54 +257,108 @@ class CamLidarTool(object):
         @return: None
         """
 
-        # camera distortion
-        self.distortion = np.array([-0.165483, 0.0966005, 0.00094785, 0.00101802])
+        # camera distortion and calibration matrix
+        self.distortion = np.array([0.0478, 0.0339, -0.00033, -0.00091])        
+        self.K = as_intrinsics_matrix([1077.2, 1079.3,362.145, 636.3873])
+        self.BODY_TO_CAM0 = np.array(
+        [[0.9999763379093255, -0.004079205042965442, -0.005539287650170447, -0.008977668364731128],
+            [-0.004066386342107199, -0.9999890330121858, 0.0023234365646622014, 0.07557012320238939],
+            [-0.00554870467502187, -0.0023008567036498766, -0.9999819588046867, -0.005545773942541918],
+            [0.0, 0.0, 0.0, 1.0]])
 
-        # transformation mrh to fw camera
-        mrh_fs = cv2.FileStorage("data/calibration_data/extrinsics_mrh_forward.yaml", cv2.FILE_STORAGE_READ)
-        mrh_R = mrh_fs.getNode("R_mtx").mat()
-        mrh_t = mrh_fs.getNode("t_mtx").mat()
-        transformation_mrh_fw_cam = np.hstack((mrh_R, mrh_t))
-        transformation_mrh_fw_cam = np.vstack((transformation_mrh_fw_cam, np.array([0.0, 0.0, 0.0, 1.0])))
+        # camera 
 
-        # camera calibration matrix
-        with open('data/calibration_data/forward.yaml', 'r') as f:
-            fw_cam_trans = yaml.safe_load(f)
-        self.K = np.array(fw_cam_trans['camera_matrix']['data']).reshape(3, 3)
+        # init transformation
+        transformation =  np.array(
+            [[1.,  0.0, 0., -0.2],
+            [0.,0.9553365, -0.2955202, 0.2],
+            [0.,  0.2955202,  0.9553365, 0.0],
+            [0.0, 0.0, 0.0, 1.0]])
+        
 
-        # FW to MRH transformation
-        with open('data/calibration_data/static_transformations.yaml') as f:
-            fw_to_mrh_yaml = yaml.safe_load(f)
-        trans_data = fw_to_mrh_yaml['2020-07-05_tuggen']['fw_lidar_to_mrh_lidar']['translation']
-        fw_to_mrh_t = np.array([trans_data['x'], trans_data['y'], trans_data['z']])
-        rot_data = fw_to_mrh_yaml['2020-07-05_tuggen']['fw_lidar_to_mrh_lidar']['rotation']
-        r = R.from_euler('zyx', np.array([rot_data['yaw'], rot_data['pitch'], rot_data['roll']]), degrees=False)
-        fw_to_mrh_R = r.as_matrix()
-
-        transformation_fw_mrh = np.column_stack((fw_to_mrh_R, fw_to_mrh_t))  # create 3x4 matrix
-        transformation_fw_mrh = np.vstack((transformation_fw_mrh, np.array([0.0, 0.0, 0.0, 1.0])))  # create 4x4 matrix
-
-        # combine both transformations together
-        transformation = np.matmul(transformation_mrh_fw_cam, transformation_fw_mrh)
-
+        # np.array(
+        # [[1., -0.0000000,  0.0, -0.],
+        #     [0.0,  1., 0.0, 0.],
+        #     [0.0,  0.0,  1., -0.0],
+        #     [0.0, 0.0, 0.0, 1.0]])
+        
+        # np.array(
+        # [[1.,  0.0, 0., -0.2],
+        #     [0.,0.9553365, -0.2955202, -0.1],
+        #     [0.,  0.2955202,  0.9553365, -0.1],
+        #     [0.0, 0.0, 0.0, 1.0]])
+        
+        # np.array(
+        # [[1., -0.0000000,  0.0, -0.],
+        #     [0.0,  1., 0.0, 0.],
+        #     [0.0,  0.0,  1., -0.0],
+        #     [0.0, 0.0, 0.0, 1.0]])
+        
+        # np.array(
+        # [[1.,  0.0, 0., -0.2],
+        #     [0.,0.9553365, -0.2955202, -0.1],
+        #     [0.,  0.2955202,  0.9553365, -0.1],
+        #     [0.0, 0.0, 0.0, 1.0]])
+        
+        # np.array(
+        # [[-0.99859172,  0.00570201, -0.05274519, 0.36],
+        #     [0.02287402, -0.85077482, -0.52503237, 0.],
+        #     [-0.04786802, -0.52549948,  0.84944626, 0.],
+        #     [0.0, 0.0, 0.0, 1.0]])
+# [  1.0000000,  0.0000000,  0.0000000;
+#    0.0000000,  0.9610555, -0.2763557;
+#    0.0000000,  0.2763557,  0.9610555 ]      
         # extract rotation, translation from transformation matrix
         self.translation = transformation[0:-1, 3]
-        rotation = transformation[0:-1, 0:3]
+        rotation = np.array([  0.9999500, -0.0000000,  0.0099998,
+   0.0036161,  0.9323273, -0.3615974,
+  -0.0093231,  0.3616154,  0.9322807 ]).reshape(3,3)
+        
+        
+        
+        # transformation[0:-1, 0:3]
         rotation, _ = cv2.Rodrigues(rotation)
         self.rotation = rotation
 
-    def draw_lidar_to_canvas(self, projected_points: np.ndarray, color: str = 'blue') -> None:
+
+    def draw_lidar_to_canvas(self, projected_points: np.ndarray, z_values = None) -> None:
+        def rgb_to_four_bits_per_color_string(red, green, blue):
+            # Convert the RGB values to hexadecimal strings and remove the '0x' prefix
+            red_hex = format(red, '02x')
+            green_hex = format(green, '02x')
+            blue_hex = format(blue, '02x')
+
+            # Combine the hexadecimal values to form the four bits per color string
+            color_string = red_hex.upper() + green_hex.upper() + blue_hex.upper()
+            return color_string
+
         """
         Draws the projected LiDAR points to the canvas with a tkinter rectangle
         @param projected_points: nx2 array of LiDAR points projected to the camera
         @param color: tkinter string of the fill color.
                       Check: http://www.science.smith.edu/dftwiki/index.php/Color_Charts_for_TKinter for colors
         """
+        if isinstance(z_values, np.ndarray):
+            z_values = z_values.reshape(-1,1)
+            z_values = (255* (z_values - np.min(z_values)) / (np.max(z_values) - np.min(z_values) + 1e-5) ).astype(np.uint8)
+            # (255* (z_values ) / (np.max(z_values)+ 1e-5) ).astype(np.uint8)
+            # (255* (z_values - np.min(z_values)) / (np.max(z_values) - np.min(z_values) + 1e-5) ).astype(np.uint8)
+            z_values = cv2.applyColorMap(z_values, cv2.COLORMAP_JET)
+        else:
+            z_values = np.ones(len(projected_points)).reshape(-1,1)
+            z_values = (255* (z_values - np.min(z_values)) / (np.max(z_values) - np.min(z_values) + 1e-5) ).astype(np.uint8)
+            z_values = cv2.applyColorMap(z_values, cv2.COLORMAP_JET)
+        max_depth = np.max(z_values)
+        min_depth = np.min(z_values)
+        print("draw pointcloud length", len(projected_points))
 
-        for point in projected_points:
+        for count, point in enumerate(projected_points):
             x = point[0]
             y = point[1]
-            point = self.canvas.create_rectangle(x - 1, y - 1, x + 1, y + 1, fill=color, width=0)
+            z = z_values[count][0] # use to decide color
+            color_string = rgb_to_four_bits_per_color_string(z[0],z[1],z[2])
+            color_string = '#'+color_string
+            point = self.canvas.create_rectangle(x - 1, y - 1, x + 1, y + 1, fill=color_string, width=0)
             self.lidar_on_canvas.append(point)  # store a reference to the rectangle so that it can be deleted
 
     def display_image(self) -> None:
@@ -261,7 +387,10 @@ class CamLidarTool(object):
 
         _, r, t = cv2.solvePnP(np.array(self.lidar_points_3d[indices], dtype=np.float32),
                                np.array(self.selected_camera_points, dtype=np.float32),
-                               self.K, self.distortion)
+                               cameraMatrix = self.K, distCoeffs = self.distortion)
+                            #    rvec = self.rotation,
+                            #    tvec = cv2.UMat(self.translation),
+                            #    useExtrinsicGuess = True)
 
         """
     [[0.18934124]
@@ -315,7 +444,8 @@ class CamLidarTool(object):
         x = eventorigin.x
         y = eventorigin.y
 
-        if self.button_pressed or y > 640:
+
+        if self.button_pressed:
             return
 
         if self.state == States.CAMERA_SELECTION:
@@ -347,7 +477,7 @@ class CamLidarTool(object):
     def run(self):
         img_shape = self.image.shape
         self.canvas = tk.Canvas(self.root,
-                                width=img_shape[1],
+                                width=img_shape[1]+180,
                                 height=img_shape[0] + 80)
 
         self.root.bind(
@@ -357,29 +487,31 @@ class CamLidarTool(object):
         # init state
         self.state_label = tk.Label(self.root, text="Select a camera point")
         self.status_label = tk.Label(self.root, text="0 point pairs selected (minimum 10)")
-        self.state_label.place(x=40, y=img_shape[0] + 5)
-        self.status_label.place(x=300, y=img_shape[0] + 5)
+        self.state_label.place(x=40, y=50)
+        self.status_label.place(x=300, y=50)
         self.state = States.CAMERA_SELECTION
 
         self.main_button = tk.Button(self.canvas, text="Continue")
         self.main_button.bind("<ButtonPress>", self._button_press)
         self.main_button.bind("<ButtonRelease>", self._button_release)
-        self.main_button.place(x=600, y=img_shape[0] + 5)
+        self.main_button.place(x=600, y=50)
         self.main_button.config(state=tk.DISABLED)
 
         self.display_image()
 
         points = np.array(self.pointcloud[:, :3])
-        mask_behind = points[:, 1] < 0
+        mask_behind = points[:, -1] > 0
         points = points[mask_behind]
+        print('forwad points',np.shape(points))
         self.lidar_points_3d = points
-
+        z_value = self.lidar_points_3d[:,-1]
         projected_points, _ = cv2.projectPoints(points, self.rotation, self.translation, self.K, self.distortion)
+
         projected_points = np.squeeze(projected_points)
         self.projected_points = projected_points
 
         self.nearest_neighbor = NearestNeighbors(n_neighbors=1, algorithm='ball_tree').fit(projected_points)
 
-        self.draw_lidar_to_canvas(projected_points, 'red')
+        self.draw_lidar_to_canvas(projected_points, z_value)
 
         self.root.mainloop()
